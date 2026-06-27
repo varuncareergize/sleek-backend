@@ -4,7 +4,7 @@ from unittest import mock
 import stripe
 from django.test import TestCase, override_settings
 
-from .models import Car, Booking
+from .models import Car, Booking, Payment
 
 
 def _make_car():
@@ -36,13 +36,15 @@ class CreateCheckoutSessionTests(TestCase):
 
     def test_pay_later_creates_booking_without_stripe(self):
         resp = self.client.post(
-            '/api/bookings/', _booking_payload(self.car, False, '300.00'),
+            '/api/bookings/', _booking_payload(self.car, False, '0'),
             content_type='application/json',
         )
         self.assertEqual(resp.status_code, 201)
         self.assertNotIn('checkout_url', resp.json())
         self.assertEqual(Booking.objects.count(), 1)
         self.assertEqual(Booking.objects.first().status, 'pending')
+        # Server computes total_price: 150.00/day × 2 days
+        self.assertEqual(Booking.objects.first().total_price, Decimal('300.00'))
 
     @override_settings(STRIPE_SECRET_KEY='')
     def test_pay_now_without_secret_returns_503_and_deletes_booking(self):
@@ -54,10 +56,9 @@ class CreateCheckoutSessionTests(TestCase):
         self.assertEqual(Booking.objects.count(), 0)  # rolled back
 
     @override_settings(STRIPE_SECRET_KEY='sk_test_x')
-    def test_pay_now_below_minimum_returns_400_and_deletes_booking(self):
-        # AED 1.50 < 2.00 minimum
+    def test_pay_now_zero_amount_returns_400_and_deletes_booking(self):
         resp = self.client.post(
-            '/api/bookings/', _booking_payload(self.car, True, '1.50'),
+            '/api/bookings/', _booking_payload(self.car, True, '0'),
             content_type='application/json',
         )
         self.assertEqual(resp.status_code, 400)
@@ -65,7 +66,7 @@ class CreateCheckoutSessionTests(TestCase):
 
     @override_settings(STRIPE_SECRET_KEY='sk_test_x', FRONTEND_URL='https://fe.test')
     def test_pay_now_creates_session_and_redirects(self):
-        fake = mock.Mock(url='https://stripe.test/session/123')
+        fake = mock.Mock(id='cs_test_session_123', url='https://stripe.test/session/123')
         with mock.patch('stripe.checkout.Session.create', return_value=fake) as m:
             resp = self.client.post(
                 '/api/bookings/', _booking_payload(self.car, True, '50.00'),
@@ -74,16 +75,25 @@ class CreateCheckoutSessionTests(TestCase):
         self.assertEqual(resp.status_code, 201)
         self.assertEqual(resp.json()['checkout_url'], 'https://stripe.test/session/123')
 
+        # Client-sent amount used directly (50.00 AED).
+        booking = Booking.objects.first()
+        self.assertEqual(booking.total_price, Decimal('50.00'))
+
+        payment = Payment.objects.first()
+
         # Verify the Stripe call shape: AED -> fils, metadata, redirect URLs.
         _, kwargs = m.call_args
         self.assertEqual(kwargs['mode'], 'payment')
         self.assertEqual(kwargs['line_items'][0]['price_data']['currency'], 'aed')
         self.assertEqual(kwargs['line_items'][0]['price_data']['unit_amount'], 5000)
-        self.assertEqual(kwargs['metadata'], {'booking_id': str(Booking.objects.first().id)})
+        self.assertEqual(kwargs['metadata'], {
+            'booking_id': str(booking.id),
+            'payment_id': str(payment.id),
+        })
         self.assertEqual(kwargs['customer_email'], 'jane@example.com')
         self.assertEqual(kwargs['success_url'], 'https://fe.test/booking/result?status=success')
         # Booking stays pending until the webhook confirms payment.
-        self.assertEqual(Booking.objects.first().status, 'pending')
+        self.assertEqual(booking.status, 'pending')
 
     @override_settings(STRIPE_SECRET_KEY='sk_test_x')
     def test_pay_now_stripe_failure_returns_502_and_deletes_booking(self):
@@ -129,7 +139,7 @@ class WebhookTests(TestCase):
             pickup_time='09:00 AM', dropoff_time='09:00 AM', name='Jane',
             phone='501234567', email='jane@example.com', total_price=Decimal('50.00'),
         )
-        self.assertEqual(booking.status, 'pending')
+        self.assertEqual(booking.payment_status, 'pending')
 
         with override_settings(STRIPE_WEBHOOK_SECRET='whsec_x'):
             with mock.patch('stripe.Webhook.construct_event',
@@ -138,7 +148,7 @@ class WebhookTests(TestCase):
                                         content_type='application/json')
         self.assertEqual(resp.status_code, 200)
         booking.refresh_from_db()
-        self.assertEqual(booking.status, 'paid')
+        self.assertEqual(booking.payment_status, 'paid')
 
     def test_unrelated_event_does_not_touch_bookings(self):
         car = _make_car()
@@ -154,4 +164,4 @@ class WebhookTests(TestCase):
                                         content_type='application/json')
         self.assertEqual(resp.status_code, 200)
         booking.refresh_from_db()
-        self.assertEqual(booking.status, 'pending')  # untouched
+        self.assertEqual(booking.payment_status, 'pending')  # untouched

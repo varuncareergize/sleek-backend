@@ -8,14 +8,14 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
-from .models import Car, Booking
+from .models import Car, Booking, Payment
 from .serializers import CarSerializer, BookingSerializer
 
+logger = logging.getLogger(__name__)
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
 # ponytail: AED is a 2-decimal currency on Stripe -> amount in fils (AED 1.00 = 100).
-AED_MIN_FILS = 200  # Stripe's minimum charge for AED is 2.00
-logger = logging.getLogger(__name__)
+
 
 
 # =========================
@@ -175,13 +175,23 @@ class BookingListCreateAPIView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        booking = serializer.save()  # status defaults to 'pending'
+        pay_now = serializer.validated_data.get('pay_now')
+
+        if not pay_now:
+            # Pay Later: compute total_price server-side from car rate × rental days.
+            car = serializer.validated_data['car']
+            pickup = serializer.validated_data['pickup_date']
+            dropoff = serializer.validated_data['dropoff_date']
+            days = (dropoff - pickup).days or 1
+            serializer.validated_data['total_price'] = car.price_day * days
+
+        booking = serializer.save(status='pending')
 
         # Pay Later: no charge, booking is just a reservation request.
-        if not serializer.validated_data.get('pay_now'):
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        if not pay_now:
+            return Response(BookingSerializer(booking).data, status=status.HTTP_201_CREATED)
 
-        # Pay Now: spin up a Stripe Checkout Session for the pre-book amount.
+        # Pay Now: use the client-sent pre-book amount directly.
         if not settings.STRIPE_SECRET_KEY:
             booking.delete()
             return Response(
@@ -189,13 +199,21 @@ class BookingListCreateAPIView(APIView):
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        amount_fils = int(booking.total_price * 100)
-        if amount_fils < AED_MIN_FILS:
+        if booking.total_price <= 0:
             booking.delete()
             return Response(
-                {'detail': f'Minimum online payment is AED {AED_MIN_FILS / 100:.2f}.'},
+                {'detail': 'Pre-book amount must be greater than 0.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        amount_fils = int(booking.total_price * 100)
+
+        payment = Payment.objects.create(
+            booking=booking,
+            amount=booking.total_price,
+            currency='aed',
+            status='pending',
+        )
 
         try:
             session = stripe.checkout.Session.create(
@@ -211,17 +229,25 @@ class BookingListCreateAPIView(APIView):
                     },
                 }],
                 customer_email=booking.email,
-                metadata={'booking_id': str(booking.id)},
+                metadata={
+                    'booking_id': str(booking.id),
+                    'payment_id': str(payment.id),
+                },
                 success_url=f'{settings.FRONTEND_URL}/booking/result?status=success',
                 cancel_url=f'{settings.FRONTEND_URL}/booking/result?status=cancel',
             )
         except stripe.error.StripeError as exc:
-            booking.delete()  # no charge happened; don't leave an orphaned pending row
+            payment.status = 'failed'
+            payment.save(update_fields=['status'])
+            booking.delete()
             logger.warning('Stripe Checkout creation failed: %s', exc)
             return Response(
                 {'detail': 'Could not start payment. Please try again.'},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
+
+        payment.stripe_session_id = session.id
+        payment.save(update_fields=['stripe_session_id'])
 
         return Response(
             {'checkout_url': session.url},
@@ -339,7 +365,6 @@ def stripe_webhook(request):
 
     secret = settings.STRIPE_WEBHOOK_SECRET
     if not secret:
-        # ponytail: no-op until configured; return 200 so Stripe stops retrying.
         return HttpResponse('webhook secret not configured', status=200)
 
     try:
@@ -351,10 +376,81 @@ def stripe_webhook(request):
     except (ValueError, stripe.error.SignatureVerificationError):
         return HttpResponse('invalid payload', status=400)
 
-    # checkout.session.completed fires once the customer has paid.
-    if event['type'] == 'checkout.session.completed':
-        booking_id = event['data']['object'].get('metadata', {}).get('booking_id')
-        if booking_id:
-            Booking.objects.filter(pk=booking_id).update(status='paid')
+    event_type = event['type']
+    data = event['data']['object']
+
+    if event_type == 'checkout.session.completed':
+        _handle_checkout_completed(data)
+    elif event_type == 'checkout.session.expired':
+        _handle_checkout_expired(data)
+    elif event_type == 'payment_intent.payment_failed':
+        _handle_payment_failed(data)
+    elif event_type == 'charge.refunded':
+        _handle_charge_refunded(data)
 
     return HttpResponse(status=200)
+
+
+def _handle_checkout_completed(session):
+    metadata = session.get('metadata', {})
+    booking_id = metadata.get('booking_id')
+    payment_id = metadata.get('payment_id')
+
+    if payment_id:
+        Payment.objects.filter(pk=payment_id).update(
+            stripe_payment_intent_id=session.get('payment_intent'),
+            status='succeeded',
+        )
+    elif booking_id:
+        # Fallback for old sessions without payment_id in metadata
+        Payment.objects.filter(booking_id=booking_id, status='pending').update(
+            stripe_session_id=session.get('id'),
+            stripe_payment_intent_id=session.get('payment_intent'),
+            status='succeeded',
+        )
+
+    if booking_id:
+        Booking.objects.filter(pk=booking_id).update(payment_status='paid')
+
+
+def _handle_checkout_expired(session):
+    metadata = session.get('metadata', {})
+    booking_id = metadata.get('booking_id')
+    payment_id = metadata.get('payment_id')
+
+    if payment_id:
+        Payment.objects.filter(pk=payment_id).update(status='failed')
+    elif booking_id:
+        Payment.objects.filter(booking_id=booking_id, status='pending').update(status='failed')
+
+    if booking_id:
+        Booking.objects.filter(pk=booking_id).update(payment_status='failed')
+
+
+def _handle_payment_failed(payment_intent):
+    payment = Payment.objects.filter(
+        stripe_payment_intent_id=payment_intent.get('id'),
+    ).first()
+
+    if payment:
+        payment.status = 'failed'
+        payment.save(update_fields=['status'])
+        payment.booking.payment_status = 'failed'
+        payment.booking.save(update_fields=['payment_status'])
+
+
+def _handle_charge_refunded(charge):
+    payment_intent_id = charge.get('payment_intent')
+    if not payment_intent_id:
+        return
+
+    payment = Payment.objects.filter(
+        stripe_payment_intent_id=payment_intent_id,
+    ).first()
+
+    if payment:
+        payment.status = 'refunded'
+        payment.refund_reason = charge.get('reason', '')
+        payment.save(update_fields=['status', 'refund_reason'])
+        payment.booking.payment_status = 'refunded'
+        payment.booking.save(update_fields=['payment_status'])
