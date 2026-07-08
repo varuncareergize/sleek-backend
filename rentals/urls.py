@@ -5,8 +5,8 @@ from .views import (
     CarDetailAPIView,
     BookingListCreateAPIView,
     BookingDetailAPIView,
+    stripe_webhook,
 )
-
 urlpatterns = [
 
     # Cars
@@ -33,5 +33,12 @@ urlpatterns = [
         'bookings/<int:pk>/',
         BookingDetailAPIView.as_view(),
         name='booking-detail'
+    ),
+
+    # Stripe webhook (raw, signed POST from Stripe)
+    path(
+        'stripe/webhook/',
+        stripe_webhook,
+        name='stripe-webhook'
     ),
 ]
