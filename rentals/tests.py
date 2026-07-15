@@ -1,8 +1,11 @@
+import importlib
 from decimal import Decimal
 from unittest import mock
 
 import stripe
 from django.test import TestCase, override_settings
+
+import sleekbackend.sleekbackend.settings as settings_module
 
 from .models import Car, Booking, Payment
 
@@ -26,6 +29,17 @@ def _booking_payload(car, pay_now, total):
         'baby_seat': False, 'pay_now': pay_now,
         'total_price': str(total), 'status': 'pending',
     }
+
+
+class EnvLoadingTests(TestCase):
+
+    @mock.patch('dotenv.load_dotenv')
+    def test_settings_load_dotenv_from_project_root(self, mock_load_dotenv):
+        mock_load_dotenv.return_value = True
+
+        reloaded = importlib.reload(settings_module)
+
+        mock_load_dotenv.assert_called_once_with(reloaded.BASE_DIR / '.env')
 
 
 class CreateCheckoutSessionTests(TestCase):
