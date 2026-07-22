@@ -137,10 +137,10 @@ CSRF_TRUSTED_ORIGINS = [
 # Stripe
 # Set via env on Render: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, FRONTEND_URL
 # =========================
-#STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
-#STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
-#FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://www.sleek-cars.com')
+STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://www.sleek-cars.com')
 
-STRIPE_SECRET_KEY = "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"
-STRIPE_WEBHOOK_SECRET = "whsec_5B0cP1GNVDGAX5v0Wiz6i0WmIU8RQxxe"
-FRONTEND_URL =  "https://www.sleek-cars.com"
+#STRIPE_SECRET_KEY = "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"
+#STRIPE_WEBHOOK_SECRET = "whsec_5B0cP1GNVDGAX5v0Wiz6i0WmIU8RQxxe"
+#FRONTEND_URL =  "https://www.sleek-cars.com"
