@@ -131,6 +131,7 @@ CORS_ALLOW_ALL_ORIGINS = True
 CSRF_TRUSTED_ORIGINS = [
     "https://sleek-backend-3dps.onrender.com",
     "https://sleek-cars.com",
+    "https://www.sleek-cars.com"
 ]
 
 # =========================
